@@ -2,6 +2,7 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
+from .repository import utcnow
 from .rules import RuleEngine
 
 
@@ -47,14 +48,44 @@ class DomainService:
         )
         merged = dict(entity["data"])
         merged.update(patch)
-        updated = self.repository.update_entity(entity_id, expected, next_status, merged)
+        release = False
+        occupy = None
+        detail = {"patch": patch}
+        if entity["kind"] == "sample":
+            if action == "store":
+                occupy = (patch["freezer"], patch["position"])
+            elif action == "relocate":
+                change = {
+                    "from_freezer": entity["data"].get("freezer"),
+                    "from_position": entity["data"].get("position"),
+                    "to_freezer": patch["freezer"],
+                    "to_position": patch["position"],
+                    "changed_at": utcnow(),
+                    "changed_by": actor.user_id,
+                }
+                history = list(entity["data"].get("position_history") or [])
+                history.append(change)
+                merged["position_history"] = history
+                detail["position_change"] = change
+                release = True
+                occupy = (patch["freezer"], patch["position"])
+            elif action in ("anonymize", "destroy"):
+                release = True
+        updated = self.repository.update_entity_positions(
+            entity_id,
+            expected,
+            next_status,
+            merged,
+            release_sample=release,
+            occupy=occupy,
+        )
         self.audit.record(
             entity_id,
             actor,
             action,
             entity["status"],
             updated["status"],
-            {"patch": patch},
+            detail,
         )
         return updated
 
@@ -68,6 +99,9 @@ class DomainService:
         if kind:
             kind = self.rules.normalize_kind(kind)
         return self.repository.list_entities(kind=kind, status=status)
+
+    def list_positions(self):
+        return self.repository.list_positions()
 
     def audit_log(self, entity_id=None):
         return self.repository.list_audit(entity_id=entity_id)

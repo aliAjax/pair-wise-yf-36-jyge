@@ -54,6 +54,15 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS storage_positions (
+                    freezer TEXT NOT NULL,
+                    position TEXT NOT NULL,
+                    sample_id TEXT NOT NULL,
+                    occupied_at TEXT NOT NULL,
+                    PRIMARY KEY(freezer, position)
+                );
+                CREATE INDEX IF NOT EXISTS idx_positions_sample
+                    ON storage_positions(sample_id);
             """)
 
     @staticmethod
@@ -111,6 +120,18 @@ class SQLiteRepository:
         ]
 
     def update_entity(self, entity_id, expected_version, status, data):
+        return self.update_entity_positions(entity_id, expected_version, status, data)
+
+    def update_entity_positions(
+        self, entity_id, expected_version, status, data, release_sample=False, occupy=None
+    ):
+        """Update an entity and its storage occupancy in one transaction.
+
+        release_sample: drop any position row currently held by this sample.
+        occupy: (freezer, position) to take for this sample after the release.
+        The occupancy check runs inside the write transaction, so two
+        concurrent requests for the same slot cannot both succeed.
+        """
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
         connection = self._connect()
@@ -127,6 +148,26 @@ class SQLiteRepository:
                     "version conflict: expected %s, found %s"
                     % (expected_version, current_version)
                 )
+            if occupy:
+                holder = connection.execute(
+                    "SELECT sample_id FROM storage_positions WHERE freezer = ? AND position = ?",
+                    (occupy[0], occupy[1]),
+                ).fetchone()
+                if holder and holder["sample_id"] != entity_id:
+                    raise ConflictError(
+                        "position %s/%s is occupied by sample %s"
+                        % (occupy[0], occupy[1], holder["sample_id"])
+                    )
+            if release_sample:
+                connection.execute(
+                    "DELETE FROM storage_positions WHERE sample_id = ?", (entity_id,)
+                )
+            if occupy:
+                connection.execute(
+                    "INSERT OR REPLACE INTO storage_positions(freezer, position, sample_id, occupied_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (occupy[0], occupy[1], entity_id, now),
+                )
             connection.execute(
                 "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
                 "WHERE id = ? AND version = ?",
@@ -139,6 +180,36 @@ class SQLiteRepository:
         finally:
             connection.close()
         return self.get_entity(entity_id)
+
+    def list_positions(self):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM storage_positions ORDER BY freezer, position"
+            ).fetchall()
+        return [
+            {
+                "freezer": row["freezer"],
+                "position": row["position"],
+                "sample_id": row["sample_id"],
+                "occupied_at": row["occupied_at"],
+            }
+            for row in rows
+        ]
+
+    def get_position(self, freezer, position):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM storage_positions WHERE freezer = ? AND position = ?",
+                (freezer, position),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_sample_position(self, sample_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM storage_positions WHERE sample_id = ?", (sample_id,)
+            ).fetchone()
+        return dict(row) if row else None
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:

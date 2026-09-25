@@ -21,13 +21,46 @@ def _validate_consent(actor, data, lookup):
         raise ValidationError("consent scope is required")
 
 
+def _position_occupant(lookup, entity_id, freezer, position):
+    """Return the stored sample occupying freezer/position, if any."""
+    for other in _find_many(lookup, "sample", "position", position):
+        if other["id"] == entity_id:
+            continue
+        if other["status"] != "stored":
+            continue
+        if other["data"].get("freezer") == freezer:
+            return other
+    return None
+
+
 def _validate_sample_store(actor, entity, data, lookup):
     consent = _find_one(lookup, "consent", "id", data.get("consent_id"))
     if not consent or consent["status"] != "active":
         raise ValidationError("storage requires active consent")
     if "research" not in consent["data"].get("scope", []):
         raise ValidationError("consent does not include research use")
+    occupant = _position_occupant(lookup, entity["id"], data.get("freezer"), data.get("position"))
+    if occupant:
+        raise ConflictError(
+            "position %s/%s is occupied by stored sample %s"
+            % (data.get("freezer"), data.get("position"), occupant["id"])
+        )
     return {"stored_at": "2026-09-24T00:00:00Z"}
+
+
+def _validate_sample_relocate(actor, entity, data, lookup):
+    current = (entity["data"].get("freezer"), entity["data"].get("position"))
+    target = (data.get("freezer"), data.get("position"))
+    if target == current:
+        raise ValidationError("sample is already at %s/%s" % target)
+    occupant = _position_occupant(lookup, entity["id"], target[0], target[1])
+    if occupant:
+        raise ConflictError(
+            "position %s/%s is occupied by stored sample %s; "
+            "sample keeps its current position %s/%s"
+            % (target[0], target[1], occupant["id"], current[0], current[1])
+        )
+    return {}
 
 
 def _validate_withdrawal_approve(actor, entity, data, lookup):
@@ -41,17 +74,17 @@ def _validate_withdrawal_approve(actor, entity, data, lookup):
 
 
 CUSTOM_CREATE = {'participant': _validate_participant, 'consent': _validate_consent}
-CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('withdrawal', 'approve'): _validate_withdrawal_approve}
+CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('sample', 'relocate'): _validate_sample_relocate, ('withdrawal', 'approve'): _validate_withdrawal_approve}
 
 
 class RuleEngine:
     ALIASES = {'participants': 'participant', 'consents': 'consent', 'samples': 'sample', 'withdrawals': 'withdrawal'}
     INITIAL_STATUS = {'participant': 'registered', 'consent': 'draft', 'sample': 'collected', 'withdrawal': 'requested'}
-    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan',), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
+    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'relocate': (('stored',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan',), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
     CREATE_REQUIRED = {'participant': ('name',), 'consent': ('participant_id', 'scope'), 'sample': ('participant_id', 'sample_code', 'collected_at'), 'withdrawal': ('participant_id', 'requested_at')}
-    ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
+    ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'relocate'): ('freezer', 'position'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
     CREATE_ROLES = {'participant': ('admin', 'biobank'), 'consent': ('admin', 'committee'), 'sample': ('admin', 'biobank'), 'withdrawal': ('admin', 'biobank')}
-    ROLE_ACTIONS = {'close_participant': ('admin', 'biobank'), 'activate': ('admin', 'committee'), 'supersede': ('admin', 'committee'), 'withdraw': ('admin', 'committee'), 'store': ('admin', 'biobank'), 'loan': ('admin', 'biobank'), 'return': ('admin', 'biobank'), 'anonymize': ('admin', 'biobank'), 'destroy': ('admin', 'biobank'), 'approve': ('admin', 'committee'), 'execute': ('admin', 'biobank')}
+    ROLE_ACTIONS = {'close_participant': ('admin', 'biobank'), 'activate': ('admin', 'committee'), 'supersede': ('admin', 'committee'), 'withdraw': ('admin', 'committee'), 'store': ('admin', 'biobank'), 'relocate': ('admin', 'biobank'), 'loan': ('admin', 'biobank'), 'return': ('admin', 'biobank'), 'anonymize': ('admin', 'biobank'), 'destroy': ('admin', 'biobank'), 'approve': ('admin', 'committee'), 'execute': ('admin', 'biobank')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -108,10 +141,14 @@ class RuleEngine:
         return next_status, patch
 
 
-def _find_one(lookup, kind, field, value):
+def _find_many(lookup, kind, field, value):
     if lookup is None:
-        return None
-    rows = lookup(kind, field, value) or []
+        return []
+    return lookup(kind, field, value) or []
+
+
+def _find_one(lookup, kind, field, value):
+    rows = _find_many(lookup, kind, field, value)
     return rows[0] if rows else None
 
 

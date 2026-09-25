@@ -33,7 +33,10 @@ python3 app.py --db ./data.db --port 8302
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
-- `GET /api/audit`：读取审计记录。
+- `GET /api/positions`：读取当前库位占用（冰箱、库位、在库样本、占用时间）。
+- `GET /api/audit`：读取审计记录，可用`?entity_id=`过滤。
+
+样本入库（`store`）会占用库位，移库（`relocate`）在同一事务内释放旧位并占用新位，前后位置与时间写入`position_history`和审计记录；目标位置已有在库样本时请求被拒绝，样本保持原位置。匿名化和销毁会释放库位。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
 
