@@ -46,9 +46,13 @@ def create_handler(service, rules, static_dir):
             return Actor.from_headers(self.headers)
 
         def _body(self):
+            cached = getattr(self, "_cached_body", None)
+            if cached is not None:
+                return cached
             length = int(self.headers.get("Content-Length", "0") or 0)
             if not length:
-                return {}
+                self._cached_body = {}
+                return self._cached_body
             raw = self.rfile.read(length)
             try:
                 value = json.loads(raw.decode("utf-8"))
@@ -56,6 +60,7 @@ def create_handler(service, rules, static_dir):
                 raise ValidationError("request body must be valid JSON")
             if not isinstance(value, dict):
                 raise ValidationError("request body must be a JSON object")
+            self._cached_body = value
             return value
 
         def _fail(self, exc):
@@ -85,6 +90,16 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "locations"]:
+                    return self._send(200, {"items": service.list_locations()})
+                if (
+                    len(parts) == 4
+                    and parts[:2] == ["api", "entities"]
+                    and parts[3] == "locations"
+                ):
+                    return self._send(
+                        200, {"items": service.location_history(parts[2])}
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":

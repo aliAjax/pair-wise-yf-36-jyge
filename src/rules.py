@@ -27,7 +27,42 @@ def _validate_sample_store(actor, entity, data, lookup):
         raise ValidationError("storage requires active consent")
     if "research" not in consent["data"].get("scope", []):
         raise ValidationError("consent does not include research use")
+    _ensure_slot_free(lookup, data.get("freezer"), data.get("position"))
     return {"stored_at": "2026-09-24T00:00:00Z"}
+
+
+def _validate_sample_relocate(actor, entity, data, lookup):
+    freezer = data.get("freezer")
+    position = data.get("position")
+    current_freezer = entity["data"].get("freezer")
+    current_position = entity["data"].get("position")
+    if current_freezer == freezer and current_position == position:
+        raise ValidationError("target position is the same as current position")
+    _ensure_slot_free(
+        lookup,
+        freezer,
+        position,
+        sample_id=entity["id"],
+        current=(current_freezer, current_position),
+    )
+    return {"freezer": freezer, "position": position}
+
+
+def _ensure_slot_free(lookup, freezer, position, sample_id=None, current=None):
+    """库位占用判断：目标位置已有在库样本时拒绝，样本保持在原位置。"""
+    if not freezer or not position:
+        raise ValidationError("freezer and position are required")
+    occupant = _find_one(lookup, "location", "slot", (freezer, position))
+    if occupant:
+        holder_id = occupant.get("sample_id")
+        message = "目标位置 %s/%s 已被在库样本 %s 占用" % (freezer, position, holder_id)
+        if sample_id and current:
+            message += "；样本 %s 保留在原位置 %s/%s" % (
+                sample_id,
+                current[0],
+                current[1],
+            )
+        raise ConflictError(message)
 
 
 def _validate_withdrawal_approve(actor, entity, data, lookup):
@@ -41,17 +76,27 @@ def _validate_withdrawal_approve(actor, entity, data, lookup):
 
 
 CUSTOM_CREATE = {'participant': _validate_participant, 'consent': _validate_consent}
-CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('withdrawal', 'approve'): _validate_withdrawal_approve}
+CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('sample', 'relocate'): _validate_sample_relocate, ('withdrawal', 'approve'): _validate_withdrawal_approve}
 
 
 class RuleEngine:
     ALIASES = {'participants': 'participant', 'consents': 'consent', 'samples': 'sample', 'withdrawals': 'withdrawal'}
     INITIAL_STATUS = {'participant': 'registered', 'consent': 'draft', 'sample': 'collected', 'withdrawal': 'requested'}
-    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan',), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
+    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'relocate': (('stored',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan',), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
     CREATE_REQUIRED = {'participant': ('name',), 'consent': ('participant_id', 'scope'), 'sample': ('participant_id', 'sample_code', 'collected_at'), 'withdrawal': ('participant_id', 'requested_at')}
-    ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
+    ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'relocate'): ('freezer', 'position'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
     CREATE_ROLES = {'participant': ('admin', 'biobank'), 'consent': ('admin', 'committee'), 'sample': ('admin', 'biobank'), 'withdrawal': ('admin', 'biobank')}
-    ROLE_ACTIONS = {'close_participant': ('admin', 'biobank'), 'activate': ('admin', 'committee'), 'supersede': ('admin', 'committee'), 'withdraw': ('admin', 'committee'), 'store': ('admin', 'biobank'), 'loan': ('admin', 'biobank'), 'return': ('admin', 'biobank'), 'anonymize': ('admin', 'biobank'), 'destroy': ('admin', 'biobank'), 'approve': ('admin', 'committee'), 'execute': ('admin', 'biobank')}
+    ROLE_ACTIONS = {'close_participant': ('admin', 'biobank'), 'activate': ('admin', 'committee'), 'supersede': ('admin', 'committee'), 'withdraw': ('admin', 'committee'), 'store': ('admin', 'biobank'), 'relocate': ('admin', 'biobank'), 'loan': ('admin', 'biobank'), 'return': ('admin', 'biobank'), 'anonymize': ('admin', 'biobank'), 'destroy': ('admin', 'biobank'), 'approve': ('admin', 'committee'), 'execute': ('admin', 'biobank')}
+
+    # 声明各动作对库位的影响，服务层据此编排落盘；判断仍在自定义校验中完成
+    LOCATION_EFFECTS = {
+        ('sample', 'store'): 'occupy',
+        ('sample', 'relocate'): 'relocate',
+        ('sample', 'destroy'): 'release',
+    }
+
+    def location_effect(self, kind, action):
+        return self.LOCATION_EFFECTS.get((self.normalize_kind(kind), action))
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)

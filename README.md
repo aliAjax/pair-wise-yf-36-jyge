@@ -33,9 +33,18 @@ python3 app.py --db ./data.db --port 8302
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `GET /api/locations`：当前在占库位清单（格位、样本、占用时间）。
+- `GET /api/entities/<id>/locations`：单个样本的历次库位变化（占用/释放时间）。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
+
+## 库位占用与移库
+
+- 样本的`store`（入库）、`relocate`（移库）、`destroy`（销毁）由规则层声明库位效果，服务层在单个SQLite事务内编排：实体版本更新、旧位释放、新位占用、审计记录一起提交，失败一起回滚。
+- 一个冻存格位同一时刻只允许一个在库样本：规则层预判，`location_occupancy`表上的部分唯一索引（`released_at IS NULL`）兜底并发。两个请求抢同一格时只有一人成功，落败方返回`409 ConflictError`并说明原位置保持不变。
+- 目标位置已被占用时不移库：样本停留在原库位，冲突说明中给出占用样本与前后位置。
+- 移库记录保留前/后位置、占用时间与释放时间；`GET /api/entities/<id>/locations`和演示页面可查看当前库位与历次变化。
 
 ## 测试
 
